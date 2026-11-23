@@ -3,7 +3,14 @@ name = "bbbc021-profiling"
 version = "0.1.0"
 description = "Image-based morphological profiling of MCF-7 cells (BBBC021)"
 requires-python = ">=3.11,<3.12"
-dependencies = ["pandas==3.1.1"]
+dependencies = [
+    "matplotlib==3.11.2",
+    "numpy==2.4.6",
+    "pandas==3.1.1",
+    "scikit-image==0.26.0",
+    "scipy==1.17.1",
+    "tifffile==2026.3.3",
+]
 
 [project.scripts]
 bbbc021 = "bbbc021_profiling.cli:main"

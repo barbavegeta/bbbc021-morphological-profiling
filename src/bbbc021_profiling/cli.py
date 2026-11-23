@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import download, images, metadata, remote_zip
+from . import download, illumination, images, metadata, qc, remote_zip
 
 
 def _data_dir(args) -> Path:
@@ -76,6 +76,42 @@ def cmd_images(args) -> None:
     print(json.dumps(summary, indent=1))
 
 
+def _selected(args) -> pd.DataFrame:
+    """The scope's fields, limited to --plate if given, after checking that their TIFFs are on disk."""
+    data = _data_dir(args)
+    selected = metadata.select_fields(metadata.load_fields(data / "metadata"), include_plate_controls=True)
+    if args.plate:
+        selected = selected[selected["plate"].isin(args.plate)]
+    missing = [p for p in images.needed_files(selected)["path"] if not (data / "images" / p).exists()]
+    if missing:
+        raise SystemExit(f"{len(missing)} TIFFs are missing, e.g. {missing[0]}; run the images stage first")
+    return selected
+
+
+def cmd_qc(args) -> None:
+    data = _data_dir(args)
+    out = data / "derived" / "qc"
+    m = qc.run_qc(_selected(args), data / "images", out, workers=args.workers)
+    s = qc.format_summary(m)
+    s.to_csv(out / "format_summary.csv", index=False)
+    print(s.to_string(index=False))
+    flags = m["flag"].str.get_dummies(";").groupby(m["channel"]).sum()
+    print(flags.to_string())
+    print(f"flagged field-channels: {(m['flag'] != '').sum()} of {len(m)}")
+
+
+def cmd_illumination_compare(args) -> None:
+    df = illumination.run_compare(_selected(args), _data_dir(args) / "derived" / "qc")
+    t = df.groupby(["channel", "estimator", "scope"]).agg(
+        half_plates=("cv", "size"), fields_fit=("fields_fit", "median"), cv=("cv", "median"), max_over_min=("max_over_min", "median"))
+    print(t.round(3).to_string())
+
+
+def cmd_illumination_fit(args) -> None:
+    df = illumination.run_fit(_selected(args), _data_dir(args) / "derived" / "qc", args.estimator, args.scope)
+    print(df.groupby("channel")[["offset", "gain_min", "gain_max"]].describe().T.round(3).to_string())
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="bbbc021", description=__doc__)
     p.add_argument("--data-dir", help="data root (default: $BBBC021_DATA_DIR or ./data)")
@@ -103,6 +139,21 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--verify", action="store_true",
                    help="recompute every SHA-256 against the manifest instead of fetching")
     s.set_defaults(func=cmd_images)
+
+    s = sub.add_parser("qc", help="per-field QC metrics, outlier flags and block summaries")
+    s.add_argument("--plate", action="append", help="limit to this plate (repeatable)")
+    s.add_argument("--workers", type=int, default=4, help="parallel processes (default 4)")
+    s.set_defaults(func=cmd_qc)
+
+    s = sub.add_parser("illumination-compare", help="held-out flatness of every illumination estimator and scope")
+    s.add_argument("--plate", action="append", help="limit to this plate (repeatable)")
+    s.set_defaults(func=cmd_illumination_compare)
+
+    s = sub.add_parser("illumination-fit", help="fit and save the illumination functions")
+    s.add_argument("--plate", action="append", help="limit to this plate (repeatable)")
+    s.add_argument("--estimator", choices=illumination.ESTIMATORS, required=True)
+    s.add_argument("--scope", choices=illumination.SCOPES, required=True)
+    s.set_defaults(func=cmd_illumination_fit)
 
     args = p.parse_args(argv)
     args.func(args)
