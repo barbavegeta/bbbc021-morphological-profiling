@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import download, metadata
+from . import download, images, metadata, remote_zip
 
 
 def _data_dir(args) -> Path:
@@ -52,6 +52,24 @@ def cmd_scope(args) -> None:
     print(json.dumps(summary, indent=1))
 
 
+def cmd_images(args) -> None:
+    data = _data_dir(args)
+    fields = metadata.load_fields(data / "metadata")
+    needed = images.needed_files(metadata.select_fields(fields, include_plate_controls=args.include_plate_controls))
+    if args.plate:
+        unknown = set(args.plate) - set(needed["plate"])
+        if unknown:
+            raise SystemExit(f"no selected TIFFs on plate(s): {sorted(unknown)}")
+        needed = needed[needed["plate"].isin(args.plate)]
+    session = remote_zip.HttpSession(download.USER_AGENT)
+    summary = images.download_images(
+        needed, data / "images", data / "manifests" / "images",
+        lambda plate: remote_zip.HttpRangeReader(metadata.ZIP_URL.format(plate=plate), session),
+        workers=args.workers, directories_only=args.directories_only, log=lambda s: print(s, flush=True),
+    )
+    print(json.dumps(summary, indent=1))
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="bbbc021", description=__doc__)
     p.add_argument("--data-dir", help="data root (default: $BBBC021_DATA_DIR or ./data)")
@@ -68,6 +86,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--include-plate-controls", action="store_true",
                    help="also keep the plate-control wells on the selected plates")
     s.set_defaults(func=cmd_scope)
+
+    s = sub.add_parser("images", help="fetch the selected TIFFs from the plate ZIPs with range requests")
+    s.add_argument("--include-plate-controls", action="store_true",
+                   help="also fetch the plate-control wells on the selected plates")
+    s.add_argument("--plate", action="append", help="limit to this plate (repeatable)")
+    s.add_argument("--workers", type=int, default=4, help="parallel connections (default 4)")
+    s.add_argument("--directories-only", action="store_true",
+                   help="read and cache each ZIP's file list and report exact sizes, without fetching TIFFs")
+    s.set_defaults(func=cmd_images)
 
     args = p.parse_args(argv)
     args.func(args)
