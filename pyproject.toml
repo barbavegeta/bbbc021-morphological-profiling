@@ -1,0 +1,22 @@
+[project]
+name = "bbbc021-profiling"
+version = "0.1.0"
+description = "Image-based morphological profiling of MCF-7 cells (BBBC021)"
+requires-python = ">=3.11,<3.12"
+dependencies = ["pandas==3.1.1"]
+
+[project.scripts]
+bbbc021 = "bbbc021_profiling.cli:main"
+
+[dependency-groups]
+dev = ["pytest==9.2.0"]
+
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bbbc021_profiling"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
