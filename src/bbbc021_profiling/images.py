@@ -2,8 +2,9 @@
 
 For each plate the ZIP's central directory is read and cached. Every needed file must be listed
 there under <plate>/<file name from BBBC021_v1_image.csv>. Each TIFF is fetched on its own,
-decompressed, checked against the directory's CRC-32 and size, written atomically and recorded in a
-manifest with its SHA-256. A rerun skips TIFFs that are already in the manifest and on disk.
+decompressed, checked against the directory's CRC-32 and size, synced to disk, moved into place and
+only then recorded in a manifest with its SHA-256. A rerun skips TIFFs that are in the manifest and on
+disk at the recorded size, and drops manifest rows whose file is missing or has another size.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 
 from .metadata import CHANNELS, ZIP_URL
@@ -57,6 +59,28 @@ def _read_csv(path: Path, columns: list[str]) -> pd.DataFrame:
     if path.exists() and path.stat().st_size:
         return pd.read_csv(path, keep_default_na=False)
     return pd.DataFrame(columns=columns)
+
+
+def write_durable(path: Path, data: bytes) -> None:
+    """Write through a synced temporary file, so path either holds all of data or does not exist."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".part")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+        if hasattr(os, "posix_fadvise"):  # release the page cache, which a 28 GB download would fill
+            os.posix_fadvise(fh.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    os.replace(tmp, path)
+
+
+def _write_manifest(path: Path, rows: pd.DataFrame) -> None:
+    write_durable(path, rows.to_csv(index=False, columns=TIFF_COLUMNS).encode())
+
+
+def _size_matches(image_root: Path, row: dict) -> bool:
+    p = safe_path(image_root, row["path"])
+    return p.exists() and p.stat().st_size == int(row["bytes"])
 
 
 class _Appender:
@@ -116,9 +140,13 @@ def download_images(
     plates_prev = _read_csv(plates_csv, PLATE_COLUMNS).set_index("plate").to_dict("index") if plates_csv.exists() else {}
 
     done_rows = _read_csv(tiffs_csv, TIFF_COLUMNS)
-    done = {r["path"] for r in done_rows.to_dict("records")
-            if safe_path(image_root, r["path"]).exists()
-            and safe_path(image_root, r["path"]).stat().st_size == int(r["bytes"])}
+    keep = np.array([_size_matches(image_root, r) for r in done_rows.to_dict("records")], dtype=bool)
+    kept = done_rows.loc[keep].drop_duplicates("path", keep="last")
+    if len(kept) < len(done_rows):
+        log(f"dropped {len(done_rows) - len(kept)} manifest rows without a matching file")
+        if not directories_only:
+            _write_manifest(tiffs_csv, kept)
+    done = set(kept["path"])
     appender = None if directories_only else _Appender(tiffs_csv, TIFF_COLUMNS)
 
     plate_rows, totals = [], {"tiffs_fetched": 0, "bytes_transferred": 0}
@@ -133,11 +161,7 @@ def download_images(
             except MemberError:
                 if attempt == 1:
                     raise
-        out = safe_path(image_root, rel)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_name(out.name + ".part")
-        tmp.write_bytes(data)
-        os.replace(tmp, out)
+        write_durable(safe_path(image_root, rel), data)
         appender.write([plate, rel, m.name, m.compressed_size, m.size, m.crc32,
                         hashlib.sha256(data).hexdigest(),
                         datetime.now(timezone.utc).isoformat(timespec="seconds")])
@@ -196,4 +220,30 @@ def download_images(
         "needed_bytes": int(p["needed_bytes"].sum()),
         "tiffs_fetched_now": totals["tiffs_fetched"],
         "bytes_transferred_now": totals["bytes_transferred"],
+    }
+
+
+def verify_images(needed: pd.DataFrame, image_root: Path, manifest_dir: Path) -> dict:
+    """Recompute the SHA-256 of every needed TIFF and compare it with the manifest.
+
+    Rows whose file is missing or differs are dropped from the manifest, so the next download run
+    fetches those files again.
+    """
+    tiffs_csv = manifest_dir / "tiffs.csv"
+    rows = _read_csv(tiffs_csv, TIFF_COLUMNS).drop_duplicates("path", keep="last")
+    ok, bad = np.zeros(len(rows), dtype=bool), []
+    for i, r in enumerate(rows.to_dict("records")):
+        p = safe_path(image_root, r["path"])
+        ok[i] = good = p.exists() and hashlib.sha256(p.read_bytes()).hexdigest() == r["sha256"]
+        if not good:
+            bad.append(r["path"])
+    if bad:
+        _write_manifest(tiffs_csv, rows.loc[ok])
+    verified = set(rows.loc[ok, "path"])
+    return {
+        "tiffs_needed": len(needed),
+        "verified": len(verified & set(needed["path"])),
+        "failed": len(bad),
+        "not_in_manifest": len(set(needed["path"]) - set(rows["path"])),
+        "failed_paths": bad[:20],
     }

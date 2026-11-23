@@ -128,6 +128,30 @@ def test_rerun_resumes(archive):
     assert readers["P2"].calls == 1 and readers["P1"].calls == 0
 
 
+def test_truncated_file_is_dropped_from_manifest_and_refetched(archive):
+    _run(archive, {p: BytesReader(z) for p, z in archive["zips"].items()})
+    rel = "Week1/P1/D05_w1.tif"
+    (archive["root"] / rel).write_bytes(b"")
+    s = _run(archive, {p: BytesReader(z) for p, z in archive["zips"].items()})
+    assert s["tiffs_fetched_now"] == 1
+    assert (archive["root"] / rel).read_bytes() == archive["contents"][rel]
+    t = pd.read_csv(archive["manifest"] / "tiffs.csv")
+    assert len(t) == 9 and t["path"].is_unique
+
+
+def test_verify_finds_changed_content(archive):
+    _run(archive, {p: BytesReader(z) for p, z in archive["zips"].items()})
+    v = images.verify_images(archive["needed"], archive["root"], archive["manifest"])
+    assert v["verified"] == 9 and v["failed"] == 0 and v["not_in_manifest"] == 0
+    f = archive["root"] / "Week1/P2/B02_w4.tif"
+    f.write_bytes(bytes(len(f.read_bytes())))  # same size, other content
+    v = images.verify_images(archive["needed"], archive["root"], archive["manifest"])
+    assert v["verified"] == 8 and v["failed_paths"] == ["Week1/P2/B02_w4.tif"]
+    s = _run(archive, {p: BytesReader(z) for p, z in archive["zips"].items()})
+    assert s["tiffs_fetched_now"] == 1
+    assert f.read_bytes() == archive["contents"]["Week1/P2/B02_w4.tif"]
+
+
 def test_directories_only(archive):
     s = _run(archive, {p: BytesReader(z) for p, z in archive["zips"].items()}, directories_only=True)
     assert s["tiffs_done"] == 0 and s["needed_bytes"] == sum(len(v) for k, v in archive["contents"].items()

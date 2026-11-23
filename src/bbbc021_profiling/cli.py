@@ -61,6 +61,12 @@ def cmd_images(args) -> None:
         if unknown:
             raise SystemExit(f"no selected TIFFs on plate(s): {sorted(unknown)}")
         needed = needed[needed["plate"].isin(args.plate)]
+    if args.verify:
+        report = images.verify_images(needed, data / "images", data / "manifests" / "images")
+        print(json.dumps(report, indent=1))
+        if report["verified"] != report["tiffs_needed"] or report["failed"]:
+            raise SystemExit(1)
+        return
     session = remote_zip.HttpSession(download.USER_AGENT)
     summary = images.download_images(
         needed, data / "images", data / "manifests" / "images",
@@ -94,6 +100,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--workers", type=int, default=4, help="parallel connections (default 4)")
     s.add_argument("--directories-only", action="store_true",
                    help="read and cache each ZIP's file list and report exact sizes, without fetching TIFFs")
+    s.add_argument("--verify", action="store_true",
+                   help="recompute every SHA-256 against the manifest instead of fetching")
     s.set_defaults(func=cmd_images)
 
     args = p.parse_args(argv)
