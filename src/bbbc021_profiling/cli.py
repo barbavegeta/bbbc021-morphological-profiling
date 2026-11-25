@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import download, illumination, images, metadata, qc, remote_zip
+from . import download, figures, illumination, images, metadata, qc, remote_zip
 
 
 def _data_dir(args) -> Path:
@@ -112,6 +112,12 @@ def cmd_illumination_fit(args) -> None:
     print(df.groupby("channel")[["offset", "gain_min", "gain_max"]].describe().T.round(3).to_string())
 
 
+def cmd_figures(args) -> None:
+    data = _data_dir(args)
+    for path in figures.run(_selected(args), data / "images", data / "derived" / "qc", args.scope):
+        print(path)
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="bbbc021", description=__doc__)
     p.add_argument("--data-dir", help="data root (default: $BBBC021_DATA_DIR or ./data)")
@@ -154,6 +160,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--estimator", choices=illumination.ESTIMATORS, required=True)
     s.add_argument("--scope", choices=illumination.SCOPES, required=True)
     s.set_defaults(func=cmd_illumination_fit)
+
+    s = sub.add_parser("figures", help="QC and flatness figures, and local-only examples of flagged fields")
+    s.add_argument("--plate", action="append", help="limit to this plate (repeatable)")
+    s.add_argument("--scope", choices=illumination.SCOPES, default="plate", help="scope shown in the flatness maps (default plate)")
+    s.set_defaults(func=cmd_figures)
 
     args = p.parse_args(argv)
     args.func(args)
