@@ -4,11 +4,14 @@ A function f is a smooth multiplicative gain over the field, scaled to a mean of
 corrected as (image - offset) / f + offset, where offset is the plate and channel's background level,
 so the background stays level while the signal above it is flattened.
 
-Two estimators:
-  median      smoothed pixelwise median of the block means of all fields
-  foreground  mean foreground intensity above the offset at each position, as a ratio of smoothed
-              sums, with every field scaled to its own foreground mean; cell density cancels out
-              because each position is averaged over foreground pixels only
+Three estimators:
+  median        smoothed pixelwise median of the block means of all fields
+  foreground    mean foreground intensity above the offset at each position, as a ratio of smoothed
+                sums, with every field scaled to its own foreground mean; cell density cancels out
+                because each position is averaged over foreground pixels only
+  cellprofiler  the method of the illum.cppipe pipeline on the BBBC021 page: mean of all raw fields,
+                Gaussian filter of size 500 px (CellProfiler uses sigma = size / 2.35, with the
+                borders renormalised), applied as image / f without an offset
 Three scopes: the fields of one plate, of one week, or of the whole dataset.
 
 Flatness is scored on fields that were not used to fit f: how much the mean foreground intensity
@@ -25,11 +28,14 @@ import pandas as pd
 from scipy import ndimage
 
 from .metadata import CHANNELS
+from .qc import BLOCK
 
 SIGMA = 4                   # Gaussian smoothing in blocks (16 px each)
 TILES = 8                   # flatness is scored on a TILES x TILES grid
 OFFSET_PERCENTILE = 10      # of the per-field backgrounds on a plate
-ESTIMATORS = ("median", "foreground")
+CELLPROFILER_SIGMA = 500 / 2.35 / BLOCK      # in blocks
+ESTIMATORS = ("median", "foreground", "cellprofiler")
+OFFSET_APPLIED = {"median": True, "foreground": True, "cellprofiler": False}
 SCOPES = ("plate", "week", "all")
 
 
@@ -81,8 +87,16 @@ def foreground_function(parts: list[Blocks]) -> np.ndarray:
     return f / f.mean()
 
 
+def cellprofiler_function(parts: list[Blocks]) -> np.ndarray:
+    a = np.mean(np.concatenate([p.mean for p in parts]), axis=0, dtype=np.float64)
+    smooth = lambda x: ndimage.gaussian_filter(x, CELLPROFILER_SIGMA, mode="constant", cval=0)
+    f = smooth(a) / smooth(np.ones_like(a))
+    return f / f.mean()
+
+
 def fit(parts: list[Blocks], estimator: str) -> np.ndarray:
-    f = {"median": median_function, "foreground": foreground_function}[estimator](parts)
+    f = {"median": median_function, "foreground": foreground_function,
+         "cellprofiler": cellprofiler_function}[estimator](parts)
     return np.maximum(f, 0.05)      # a gain near zero would blow up the corrected image
 
 
@@ -91,10 +105,14 @@ def _tiles(a: np.ndarray, tiles: int = TILES) -> np.ndarray:
     return a.reshape(tiles, h // tiles, tiles, w // tiles).sum(axis=(1, 3))
 
 
-def foreground_map(b: Blocks, f: np.ndarray | None = None) -> np.ndarray:
-    """Mean foreground intensity above the offset per tile, scaled to a mean of 1."""
+def foreground_map(b: Blocks, f: np.ndarray | None = None, estimator: str = "foreground") -> np.ndarray:
+    """Mean foreground intensity above the offset per tile, scaled to a mean of 1.
+
+    With f, the foreground is first corrected the way the estimator applies its function.
+    """
     if f is not None:
-        b = Blocks(b.mean, (b.fg_sum - b.offset * b.fg_count) / f + b.offset * b.fg_count, b.fg_count, b.background, b.well)
+        o = b.offset if OFFSET_APPLIED[estimator] else 0.0
+        b = Blocks(b.mean, (b.fg_sum - o * b.fg_count) / f + o * b.fg_count, b.fg_count, b.background, b.well)
     num, den = b.scaled_foreground()
     m = _tiles(num) / np.maximum(_tiles(den), 1e-9)
     return m / m.mean()
@@ -148,12 +166,32 @@ def compare(blocks: dict[str, Blocks], week: dict[str, str], seed: int = 0) -> p
                          "cv": noise_floor(t, rng), "max_over_min": np.nan})
             for e in ESTIMATORS:
                 rows.append({**base, "estimator": e, "scope": "plate", "fields_fit": int((~test).sum()),
-                             **flatness(foreground_map(t, fit([b.take(~test)], e)))})
+                             **flatness(foreground_map(t, fit([b.take(~test)], e), e))})
                 for s, parts in others.items():
                     if parts:
                         rows.append({**base, "estimator": e, "scope": s, "fields_fit": sum(len(p.mean) for p in parts),
-                                     **flatness(foreground_map(t, shared[e, s]))})
+                                     **flatness(foreground_map(t, shared[e, s], e))})
     return pd.DataFrame(rows)
+
+
+def heldout_maps(blocks: dict[str, Blocks], week: dict[str, str], scope: str = "plate") -> dict[str, np.ndarray]:
+    """Mean tile map over all half-plates, uncorrected ("none") and for each estimator at one scope.
+
+    The functions are fitted on the same held-out split as in compare. With a week scope, plates
+    that are alone in their week are left out.
+    """
+    maps = {k: [] for k in ("none", *ESTIMATORS)}
+    for plate, b in sorted(blocks.items()):
+        others = [x for p, x in blocks.items() if p != plate and (scope == "all" or week[p] == week[plate])]
+        for test in well_halves(b.well):
+            parts = [b.take(~test)] if scope == "plate" else others
+            if not parts:
+                continue
+            t = b.take(test)
+            maps["none"].append(foreground_map(t))
+            for e in ESTIMATORS:
+                maps[e].append(foreground_map(t, fit(parts, e), e))
+    return {k: np.mean(v, axis=0) for k, v in maps.items()}
 
 
 def load_blocks(block_dir: Path, plates: list[str], channel: str) -> dict[str, Blocks]:
@@ -186,7 +224,8 @@ def run_fit(selected: pd.DataFrame, qc_dir: Path, estimator: str, scope: str) ->
                 fitted[k] = fit([x for q, x in blocks.items() if key(q) == k], estimator).astype(np.float32)
             np.save(out_dir / f"{p}_{ch}.npy", fitted[k])
             rows.append({"plate": p, "channel": ch, "estimator": estimator, "scope": scope, "group": k,
-                         "offset": b.offset, "gain_min": float(fitted[k].min()), "gain_max": float(fitted[k].max())})
+                         "offset": b.offset if OFFSET_APPLIED[estimator] else 0.0,
+                         "gain_min": float(fitted[k].min()), "gain_max": float(fitted[k].max())})
     df = pd.DataFrame(rows)
     df.to_csv(out_dir / "functions.csv", index=False)
     return df
