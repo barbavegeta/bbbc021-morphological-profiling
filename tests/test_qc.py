@@ -6,7 +6,7 @@ import pytest
 import tifffile
 from scipy import ndimage
 
-from bbbc021_profiling import illumination, qc
+from bbbc021_profiling import figures, illumination, qc
 from bbbc021_profiling.metadata import CHANNELS
 
 SHAPE = (256, 256)
@@ -53,10 +53,12 @@ def test_focus_slope_falls_with_blur():
 
 def test_field_metrics():
     img = np.full(SHAPE, 800, dtype=np.uint16)
-    img[:8, :16] = qc.SATURATION
+    img[:8, :16] = 3957 * 16            # a clip level below the 12-bit maximum
     m = qc.field_metrics(img)
-    assert m["saturated_pct"] == pytest.approx(100 * 128 / img.size)
-    assert m["background"] == 800 and m["max"] == 65520 and m["multiple_of_16"]
+    assert m["saturated_pct"] == pytest.approx(100 * 128 / img.size) and m["pixels_at_max"] == 128
+    assert m["background"] == 800 and m["max"] == 63312 and m["multiple_of_16"]
+    img[:8, :16] = 3000 * 16            # bright, but below the clipping range
+    assert qc.field_metrics(img)["saturated_pct"] == 0
 
 
 def test_foreground_blocks_count_the_cells():
@@ -87,6 +89,18 @@ def test_foreground_estimator_recovers_the_gain_and_ignores_density():
     for density in (None, 0.7):             # even, and crowded toward the centre
         got = illumination._tiles(illumination.fit([blocks(rng, vignette(), n=150, density=density)], "foreground"))[central]
         assert np.abs(got / got.mean() - true).max() < 0.06
+
+
+def test_cellprofiler_estimator_has_no_border_falloff_and_divides_without_an_offset():
+    n = SHAPE[0] // 8
+    count = np.full((4, n, n), 16.0)
+    rest = count, np.full(4, float(OFFSET)), np.array(["B02"] * 4)
+    flat = illumination.Blocks(np.full((4, n, n), 2000.0), 2000 * count, *rest)
+    assert illumination.fit([flat], "cellprofiler") == pytest.approx(np.ones((n, n)))
+    gain = qc.block_sum(vignette(), 8) / 64
+    shaded = illumination.Blocks(2000 * gain * np.ones((4, 1, 1)), 2000 * gain * count, *rest)
+    cv = {e: illumination.flatness(illumination.foreground_map(shaded, gain, e))["cv"] for e in ("cellprofiler", "foreground")}
+    assert cv["cellprofiler"] < 1e-6 < 1e-3 < cv["foreground"]
 
 
 def test_correction_flattens_held_out_fields():
@@ -135,5 +149,8 @@ def test_qc_and_illumination_stages(tmp_path):
     assert len(qc.format_summary(m)) == 3
     df = illumination.run_compare(selected, out)
     assert set(df["scope"]) == {"none", "plate", "week", "all"}
+    written = figures.run(selected, tmp_path / "images", out)
+    assert {"flatness.png", "flatness_maps.png", "qc_metrics.png"} <= {p.name for p in written}
+    assert all(p.parent.name == ("local_only" if p.name.startswith("flag_examples") else "figures") for p in written)
     fn = illumination.run_fit(selected, out, "foreground", "week")
     assert len(fn) == 9 and np.load(out / "illumination" / "P2_Actin.npy").shape == (16, 16)

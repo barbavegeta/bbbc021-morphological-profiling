@@ -5,7 +5,9 @@ size) and
   focus          slope of the radially averaged power spectrum on log-log axes over wavelengths of
                  8 to 64 px; blur makes it more negative. Shorter wavelengths are left out because
                  sensor noise dominates them, and a blurred noisy image would look sharper there.
-  saturated_pct  percentage of pixels at the camera maximum
+  saturated_pct  percentage of pixels at the image's own maximum, when that maximum lies in the clipping
+                 range. The images clip at a level that differs between plates and lies below 4095, so
+                 a clipped image is recognised by its pixels piling up on one top value.
   background     1st percentile of pixel intensities
 It also saves block summaries per plate and channel (see foreground_blocks) for the illumination
 correction, so that stage does not read the images again.
@@ -25,7 +27,7 @@ from skimage.filters import threshold_otsu
 
 from .metadata import CHANNELS
 
-SATURATION = 4095 * 16      # 12-bit camera values are stored multiplied by 16 in the 16-bit TIFFs
+CLIP_MIN = 3900 * 16        # lowest clip level; 12-bit camera values are stored multiplied by 16 in the 16-bit TIFFs
 BLOCK = 16                  # block size in pixels for the illumination summaries
 FOCUS_WAVELENGTHS = (8, 64) # pixels; the band of the power spectrum used for the focus slope
 FLAG_Z = 5.0                # |robust z| above which a metric is flagged within its plate and channel
@@ -73,11 +75,12 @@ def power_log_log_slope(img: np.ndarray, wavelengths: tuple[int, int] = FOCUS_WA
 
 def field_metrics(img: np.ndarray) -> dict:
     p1, p50, p99 = np.percentile(img, [1, 50, 99])
+    at_max = int((img == img.max()).sum())
     return {
         "focus": power_log_log_slope(img),
-        "saturated_pct": float(100 * np.mean(img >= SATURATION)),
+        "saturated_pct": 100 * at_max / img.size if img.max() >= CLIP_MIN else 0.0,
         "background": float(p1), "median": float(p50), "p99": float(p99),
-        "min": int(img.min()), "max": int(img.max()),
+        "min": int(img.min()), "max": int(img.max()), "pixels_at_max": at_max,
         "multiple_of_16": bool((img % 16 == 0).all()),
     }
 
@@ -151,7 +154,7 @@ def flag_outliers(m: pd.DataFrame, z: float = FLAG_Z) -> pd.DataFrame:
     blur            focus z below -z (steeper power spectrum than the plate's other fields)
     flat-spectrum   focus z above z (shallower spectrum: noise, or bright fine texture)
     high-background background z above z
-    saturated       more than FLAG_SATURATED_PCT of pixels at the camera maximum
+    saturated       more than FLAG_SATURATED_PCT of pixels clipped
     """
     m = m.copy()
     g = m.groupby(["plate", "channel"])
