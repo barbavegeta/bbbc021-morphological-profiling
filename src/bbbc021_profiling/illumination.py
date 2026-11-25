@@ -242,3 +242,19 @@ def correct(img: np.ndarray, f: np.ndarray, offset: float) -> np.ndarray:
     if f.shape != img.shape:
         f = upsample(f, img.shape)
     return (img.astype(np.float32) - offset) / f + offset
+
+
+class Corrector:
+    """Corrects an image with the fitted functions saved by run_fit: corrector(img, plate, channel)."""
+
+    def __init__(self, qc_dir: Path):
+        self.dir = qc_dir / "illumination"
+        t = pd.read_csv(self.dir / "functions.csv")
+        self.offsets = {(r.plate, r.channel): r.offset for r in t.itertuples(index=False)}
+        self._f: dict[tuple[str, str], np.ndarray] = {}
+
+    def __call__(self, img: np.ndarray, plate: str, channel: str) -> np.ndarray:
+        key = (plate, channel)
+        if key not in self._f:
+            self._f[key] = np.load(self.dir / f"{plate}_{channel}.npy")
+        return correct(img, self._f[key], self.offsets[key])
