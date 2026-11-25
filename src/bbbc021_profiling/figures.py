@@ -5,6 +5,7 @@ flatness_maps.png   mean held-out foreground intensity across the field, before 
 qc_metrics.png      focus and background of every field by plate, flagged fields highlighted
 flag_examples_*.png flagged fields beside typical fields. These contain image data, so they go to
                     local_only/ and are never committed.
+segmentation/overlays_*.png  nuclear and cell outlines of each method on sampled fields (local only)
 """
 
 from __future__ import annotations
@@ -175,3 +176,45 @@ def run(selected: pd.DataFrame, image_root: Path, qc_dir: Path, scope: str = "pl
             flatness_maps(maps, fig_dir / "flatness_maps.png", SCOPE_LABEL[scope].lower()),
             qc_metrics(m, fig_dir / "qc_metrics.png"),
             *flag_examples(m, selected, image_root, qc_dir / "local_only")]
+
+
+CROP = 480                  # px; centre of the field shown in the segmentation overlays
+OUTLINE = {"DAPI": "#ff9f1c", "Actin": "#3fd0ff"}
+
+
+def _outline(ax, img: np.ndarray, labels: np.ndarray, colour: str, title: str) -> None:
+    from skimage.segmentation import find_boundaries
+    edge = find_boundaries(labels, mode="inner")
+    overlay = np.zeros((*edge.shape, 4))
+    overlay[edge] = matplotlib.colors.to_rgba(colour)
+    ax.imshow(img, cmap="gray", vmin=np.percentile(img, 1), vmax=np.percentile(img, 99.7))
+    ax.imshow(overlay)
+    ax.set_title(title, fontsize=7.5, color=INK)
+    ax.set_axis_off()
+
+
+def segmentation_overlays(fields: pd.DataFrame, labels_dir: Path, load, out_dir: Path, nuclei: list[str],
+                          cells: list[str], crop: int = CROP) -> list[Path]:
+    """Local-only: outlines of every method on the sampled fields, one figure per field."""
+    out = []
+    for _, r in fields.iterrows():
+        fid = f"{r['plate']}_{r['well']}_{r['image_number']}"
+        img = load(r)
+        h, w = img["DAPI"].shape
+        y, x = (h - crop) // 2, (w - crop) // 2
+        view = (slice(y, y + crop), slice(x, x + crop))
+        n = max(len(nuclei), len(cells))
+        with plt.rc_context(STYLE):
+            fig, axes = plt.subplots(2, n, figsize=(2.9 * n, 6.2), squeeze=False, layout="constrained")
+            for a in axes.flat:
+                a.set_axis_off()
+            for row, kind, names, ch in ((0, "nuclei", nuclei, "DAPI"), (1, "cells", cells, "Actin")):
+                for ax, name in zip(axes[row], names):
+                    path = labels_dir / f"{kind}_{name}_{fid}.npz"
+                    if not path.exists():
+                        continue
+                    lab = np.load(path)["labels"]
+                    _outline(ax, img[ch][view], lab[view], OUTLINE[ch], f"{kind}: {name}\n{int(lab.max())} in field")
+            fig.suptitle(f"{r['moa'] if isinstance(r['moa'], str) else 'DMSO'}, {r['plate']} {r['well']} (centre {crop} px)", x=0.02, ha="left", fontsize=9)
+            out.append(_save(fig, out_dir / f"overlays_{fid}.png"))
+    return out
